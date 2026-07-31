@@ -29,9 +29,23 @@ TRAFFIC_LIMIT_GB="${TRAFFIC_LIMIT_GB:-8000}"
 ENABLE_VLESS="${ENABLE_VLESS:-true}"
 GAME_PROCESS="${GAME_PROCESS:-game.exe}"
 
-# Ubuntu/Debian 전용이다 (apt, netfilter-persistent, systemd-resolved 사용).
+# 이 파일은 VPN 서버(Ubuntu 인스턴스) "안에서" 도는 부품이다.
+# 보통은 deploy_vpn_oci.sh 가 알아서 올려서 실행하므로 직접 실행할 일이 없다.
 if ! grep -qiE '^ID(_LIKE)?=.*(ubuntu|debian)' /etc/os-release 2>/dev/null; then
-    die "Ubuntu/Debian 전용 스크립트입니다. 현재: $(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-알 수 없음}")"
+    _os=$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-알 수 없음}")
+    if [ -n "${OCI_CLI_CLOUD_SHELL:-}" ] || [[ "$(hostname 2>/dev/null)" == *cloudshell* ]]; then
+        die "$(printf '%s\n' \
+            "여기는 Cloud Shell 입니다. 이 파일이 아니라 deploy_vpn_oci.sh 를 실행하세요." \
+            "" \
+            "    ./deploy_vpn_oci.sh" \
+            "" \
+            "server-setup.sh 는 VPN 서버 안에서 도는 부품이고," \
+            "deploy_vpn_oci.sh 가 인스턴스를 만든 뒤 알아서 올려서 실행합니다." \
+            "(기존 deploy_glider_oci.sh 의 setup-glider.sh 에 해당)")"
+    fi
+    die "$(printf '%s\n' \
+        "Ubuntu/Debian 전용입니다. 현재: ${_os}" \
+        "VPN 서버로 쓸 Ubuntu 24.04 인스턴스 안에서 실행하세요.")"
 fi
 
 # SSH 로그인 계정. sshd 의 AllowUsers 에 들어가므로 여기가 틀리면 접속이 영구히 막힌다.
@@ -51,7 +65,9 @@ id "$SSH_USER" >/dev/null 2>&1 || die "계정 '$SSH_USER' 이 존재하지 않�
 USER_HOME=$(getent passwd "$SSH_USER" | cut -d: -f6)
 [ -n "$USER_HOME" ] || die "계정 '$SSH_USER' 의 홈 디렉터리를 찾을 수 없습니다."
 
-# SSH 허용 대역: 지정이 없으면 지금 접속해 있는 IP 를 쓴다.
+# SSH 허용 대역. 공백으로 구분해 여러 개를 줄 수 있다.
+# 예: 배포하는 Cloud Shell 의 IP 와 집 고정 IP 를 동시에 허용.
+# 지정이 없으면 지금 SSH 로 접속해 있는 IP 를 쓴다.
 if [ -z "${ADMIN_CIDR:-}" ] && [ -n "${SSH_CONNECTION:-}" ]; then
     _client_ip="${SSH_CONNECTION%% *}"
     if [[ "$_client_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
@@ -59,7 +75,13 @@ if [ -z "${ADMIN_CIDR:-}" ] && [ -n "${SSH_CONNECTION:-}" ]; then
     fi
 fi
 [ -n "${ADMIN_CIDR:-}" ] || die "SSH 허용 대역을 정할 수 없습니다. ADMIN_CIDR=1.2.3.4/32 형태로 지정하세요."
-[[ "$ADMIN_CIDR" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || die "ADMIN_CIDR 형식 오류: $ADMIN_CIDR"
+
+ADMIN_CIDRS=()
+for _c in $ADMIN_CIDR; do
+    [[ "$_c" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || die "ADMIN_CIDR 형식 오류: $_c"
+    ADMIN_CIDRS+=("$_c")
+done
+[ "${#ADMIN_CIDRS[@]}" -gt 0 ] || die "유효한 SSH 허용 대역이 없습니다."
 
 # 서버 공인 IP: 클라이언트 설정 파일에 넣을 접속 주소.
 if [ -z "${PUBLIC_IP:-}" ]; then
@@ -344,7 +366,13 @@ sudo iptables -A INPUT -m conntrack --ctstate INVALID -j DROP
 # Path MTU Discovery 용. 막으면 MTU 블랙홀이 생긴다.
 sudo iptables -A INPUT -p icmp --icmp-type destination-unreachable -j ACCEPT
 sudo iptables -A INPUT -p icmp --icmp-type echo-request -m limit --limit 2/s -j ACCEPT
-sudo iptables -A INPUT -p tcp -s "$ADMIN_CIDR" --dport 22 -j ACCEPT
+# SSH 출발지 제한은 OCI Security List 한 곳에서만 한다.
+# 오라클이 VNIC 단에서 막으므로 패킷이 VM 에 닿지도 않고, API 로 언제든 바꿀 수 있다.
+# 호스트 iptables 에서까지 출발지를 묶으면, 관리 위치가 바뀔 때마다
+# "규칙을 고치려면 서버에 들어가야 하고, 들어가려면 규칙을 고쳐야 하는" 순환에 빠진다.
+# (Cloud Shell 은 세션마다 IP 가 바뀌므로 특히 그렇다)
+# 무차별 대입은 키 전용 인증 + fail2ban 이 막는다.
+sudo iptables -A INPUT -p tcp --dport 22 -j ACCEPT
 sudo iptables -A INPUT -p udp --dport "$HY2_PORT" -j ACCEPT
 if [ "$ENABLE_VLESS" = "true" ]; then
     sudo iptables -A INPUT -p tcp --dport "$VLESS_PORT" -j ACCEPT
@@ -733,9 +761,11 @@ FINAL_EOF
 if [ "$ENABLE_VLESS" = "true" ]; then
     echo "      Source 0.0.0.0/0   | TCP  | Dest. Port 443    <- 폴백"
 fi
+echo "      Source 0.0.0.0/0   | ICMP | Type 3, Code 4    <- MTU 탐색"
+for _c in "${ADMIN_CIDRS[@]}"; do
+    echo "      Source ${_c} | TCP  | Dest. Port 22     <- SSH (기존 0.0.0.0/0 규칙은 삭제)"
+done
 cat <<FINAL_EOF
-      Source 0.0.0.0/0   | ICMP | Type 3, Code 4    <- MTU 탐색
-      Source ${ADMIN_CIDR} | TCP  | Dest. Port 22     <- SSH (기존 0.0.0.0/0 규칙은 삭제)
 
   ★ 내 PC 로 설정 파일 내려받기 (내 PC 터미널에서 실행):
 

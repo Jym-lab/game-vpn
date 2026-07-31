@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
 # SSH 허용 IP 갱신.
-# 집/회사 공인 IP 가 바뀌어 SSH 가 막혔을 때 실행한다.
+# 관리 위치가 바뀌어(집 IP 변경, Cloud Shell 재접속 등) SSH 가 막혔을 때 실행한다.
 #
-#   ./ssh-allow-ip.sh              현재 공인 IP 로 갱신
+#   ./ssh-allow-ip.sh              지금 이 머신의 공인 IP 로 갱신
 #   ./ssh-allow-ip.sh 1.2.3.4/32   지정한 대역으로 갱신
-#   ./ssh-allow-ip.sh --close      SSH 를 완전히 차단 (OCI 콘솔로만 관리)
+#   ./ssh-allow-ip.sh --close      SSH 를 완전히 차단
 #
-# Security List 는 OCI API 로 바꾸므로 현재 SSH 가 막혀 있어도 동작한다.
-# 호스트 iptables 갱신은 SSH 가 열린 뒤에 이어서 수행한다.
+# OCI API 만 사용한다. 서버에 SSH 로 들어가지 않으므로 지금 SSH 가 막혀 있어도,
+# 어느 머신에서 실행하든 동작한다. 스스로를 잠글 수 없는 구조다.
 #
 set -Eeuo pipefail
 
@@ -78,36 +78,16 @@ oci network security-list update --security-list-id "$SECLIST_ID" --region "$REG
 if [ "$CLOSE" = true ]; then
     ok "Security List 에서 SSH(22) 를 제거했습니다."
     warn "이제 SSH 로 접속할 수 없습니다. 다시 열려면 './ssh-allow-ip.sh' 를 실행하세요."
-    warn "호스트 iptables 규칙은 그대로 남지만 Security List 가 막고 있어 도달하지 않습니다."
     exit 0
 fi
-ok "Security List 갱신: SSH 허용 = $NEW_CIDR"
 
-# ---- 호스트 iptables 갱신 -------------------------------------------------
-SSH_OPTS=(-i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-          -o ConnectTimeout=10 -o LogLevel=ERROR)
-
-printf '서버 방화벽 갱신을 위해 SSH 접속을 시도합니다'
-CONNECTED=false
-for _ in $(seq 1 15); do
-    if ssh "${SSH_OPTS[@]}" "ubuntu@$PUBLIC_IP" true >/dev/null 2>&1; then CONNECTED=true; break; fi
-    printf '.'
-    sleep 4
-done
-printf '\n'
-[ "$CONNECTED" = true ] || die "SSH 접속 실패. Security List 반영에 시간이 걸릴 수 있으니 잠시 후 다시 실행하세요."
-
-ssh "${SSH_OPTS[@]}" "ubuntu@$PUBLIC_IP" "
-    set -e
-    sudo iptables -S INPUT | grep -- '--dport 22' | sed 's/^-A/-D/' \
-        | while IFS= read -r rule; do sudo iptables \$rule; done
-    sudo iptables -A INPUT -p tcp -s '$NEW_CIDR' --dport 22 -j ACCEPT
-    sudo netfilter-persistent save > /dev/null
-" || die "서버 iptables 갱신 실패"
-ok "서버 iptables 갱신 완료"
+ok "Security List 갱신 완료: SSH 허용 = $NEW_CIDR"
+echo
+echo "  접속: ssh -i $SSH_KEY <계정>@$PUBLIC_IP"
+echo
+echo "  반영에 몇 초 걸릴 수 있습니다. 바로 안 되면 잠시 후 다시 시도하세요."
 
 # 상태 파일 반영
 tmp=$(mktemp)
 jq --arg cidr "$NEW_CIDR" '.admin_cidr = $cidr' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
 chmod 600 "$STATE_FILE"
-ok "완료"

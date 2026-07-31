@@ -42,57 +42,75 @@ SSH 를 아예 닫으려면 배포 후 `./ssh-allow-ip.sh --close` (이후 관�
 
 ## 사용법
 
-배포 방식은 두 가지다. 결과물은 동일하다.
+### 방식 A (권장) — Cloud Shell 에서 실행
 
-| | 방식 A: 수동 | 방식 B: 전자동 |
-|---|---|---|
-| 서버 생성 | 내가 웹 콘솔에서 | 스크립트가 |
-| 필요한 것 | SSH 만 | `oci` CLI + API 키 설정 |
-| 방화벽(Security List) | 콘솔에서 직접 입력 | 스크립트가 |
-| 쓰는 파일 | `server-setup.sh` 하나 | `deploy_vpn_oci.sh` |
+**기존 `deploy_glider_oci.sh` 와 똑같은 사용법이다.** `deploy_vpn_oci.sh` 가 그 자리를
+그대로 대체한다. VCN·서브넷·Security List·인스턴스 생성까지 전부 하고, 만든 인스턴스에
+`server-setup.sh` 를 올려 실행한다.
 
-한 번만 만들 거면 **A**, 자주 지웠다 다시 만들 거면 **B** 가 편하다.
+Cloud Shell 은 `oci` CLI 가 이미 설치·인증돼 있어 별도 준비가 필요 없다.
+
+1. OCI 콘솔 우상단 `>_` 아이콘으로 **Cloud Shell** 열기
+2. `deploy_vpn_oci.sh`, `server-setup.sh` 두 파일 업로드
+   (Cloud Shell 메뉴 → Upload, 또는 `git clone`)
+3. 실행
+
+```bash
+chmod +x deploy_vpn_oci.sh server-setup.sh
+./deploy_vpn_oci.sh
+```
+
+물어보는 것:
+
+| 질문 | 답 |
+|---|---|
+| 관리용 SSH 허용 대역 | **내 집 고정 IP** 를 `1.2.3.4/32` 형태로. 모르면 내 PC 브라우저에서 <https://ifconfig.me> |
+| 기존 리소스 정리 | 처음이면 그냥 Enter |
+| 비용 알림 이메일 | 받을 주소, 건너뛰려면 Enter |
+
+> **Cloud Shell IP 는 세션마다 바뀌므로 관리용으로 쓸 수 없다.**
+> 그래서 배포 중에는 *Cloud Shell IP* 와 *내 고정 IP* 를 **둘 다** 허용해 두고,
+> 배포가 끝난 뒤 내 PC 에서 `./ssh-allow-ip.sh` 를 한 번 돌리면 내 IP 하나만 남는다.
+> (Cloud Shell IP 를 안 열면 스크립트가 서버에 접속하지 못해 설치가 실패한다)
+
+`client/` 폴더가 Cloud Shell 안에 생기므로, 메뉴 → Download 로 내려받는다.
 
 ---
 
-### 방식 A — 콘솔에서 서버를 직접 만든 경우
+### 방식 B — 인스턴스를 이미 만들어 둔 경우
 
-**1. 오라클 클라우드 콘솔에서 인스턴스 생성**
+콘솔에서 직접 만든 서버가 이미 있다면 `server-setup.sh` 만 그 서버 안에서 돌리면 된다.
+(Cloud Shell 에서 이 파일을 실행하면 안 된다. 서버 안에서 도는 부품이다)
 
-Compute → Instances → Create instance
+**1. 인스턴스 사양**
 
 | 항목 | 값 |
 |---|---|
 | Image | **Canonical Ubuntu 24.04** (Minimal 아님) |
 | Shape | **VM.Standard.A1.Flex** (Ampere / ARM) |
 | OCPU / Memory | **1 / 6GB** (Always Free 총 4/24 안) |
-| Boot volume | **50GB** (기본값 그대로 두면 됨) |
+| Boot volume | **50GB** |
 | Public IP | **Assign a public IPv4 address** 체크 |
-| SSH keys | 내 공개키 붙여넣기 또는 새로 생성해 개인키 저장 |
 
-> "Always Free eligible" 딱지가 붙는지 확인할 것. ARM 은 **홈 리전에서만** 무료다.
+> "Always Free eligible" 딱지 확인. ARM 은 **홈 리전에서만** 무료다.
 
-**2. 스크립트 올려서 실행**
+**2. 서버 안에서 실행**
 
 ```bash
 scp server-setup.sh <계정>@<서버IP>:
 ssh <계정>@<서버IP>
-bash server-setup.sh
+bash server-setup.sh          # sudo 없이
 ```
 
-SSH 허용 IP 와 서버 공인 IP 는 스크립트가 알아서 감지한다.
-게임 실행파일명을 미리 넣고 싶으면:
+SSH 허용 IP·서버 공인 IP·로그인 계정을 알아서 감지한다.
+게임 실행파일명을 미리 넣으려면 `GAME_PROCESS=MyGame.exe bash server-setup.sh`
 
-```bash
-GAME_PROCESS=MyGame.exe bash server-setup.sh
-```
+**3. 콘솔에서 Security List 규칙 추가**
 
-**3. 콘솔에서 방화벽(Security List) 규칙 추가**
+⚠️ **이 단계를 빼먹으면 접속이 안 된다.** 서버 안 방화벽은 스크립트가 열지만,
+오라클 쪽 방화벽은 콘솔에서 열어야 한다. (방식 A 는 이것도 자동)
 
-⚠️ **이 단계를 빼먹으면 접속이 안 된다.** 서버 안 방화벽은 스크립트가 열었지만,
-오라클 쪽 방화벽은 콘솔에서 열어야 한다.
-
-Networking → Virtual Cloud Networks → 내 VCN → Subnets → 서브넷 → Security Lists → 기본 목록 → **Add Ingress Rules**
+Networking → Virtual Cloud Networks → 내 VCN → Subnets → 서브넷 → Security Lists → **Add Ingress Rules**
 
 | Source | Protocol | Port / Type | 용도 |
 |---|---|---|---|
@@ -100,41 +118,14 @@ Networking → Virtual Cloud Networks → 내 VCN → Subnets → 서브넷 → 
 | `0.0.0.0/0` | **TCP** | 443 | VLESS-REALITY 폴백 |
 | `0.0.0.0/0` | **ICMP** | Type 3, Code 4 | MTU 탐색 |
 
-그리고 **기존에 있는 `0.0.0.0/0` → TCP 22 규칙은 삭제**하고,
-`내IP/32` → TCP 22 규칙으로 바꾼다. (스크립트 마지막 출력에 내 IP 가 찍혀 있다)
+기존 `0.0.0.0/0` → TCP 22 규칙은 삭제하고 `내IP/32` → TCP 22 로 바꾼다.
+(스크립트 마지막 출력에 넣어야 할 값이 그대로 찍힌다)
 
 **4. 설정 파일 내려받기**
 
 ```bash
 scp -r <계정>@<서버IP>:vpn-client ./client
 ```
-
----
-
-### 방식 B — 서버 생성까지 자동
-
-**1. 사전 준비**
-
-```bash
-# oci CLI
-bash -c "$(curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh)"
-oci setup config
-
-# 나머지
-sudo apt install -y jq curl openssh-client openssl
-```
-
-**2. 배포**
-
-```bash
-chmod +x deploy_vpn_oci.sh server-setup.sh ssh-allow-ip.sh
-./deploy_vpn_oci.sh
-```
-
-진행 중 물어보는 것:
-- SSH 를 허용할 대역 (현재 공인 IP 를 자동 감지해 기본값으로 제시)
-- 기존 리소스 정리 여부 (`DELETE` 입력 시에만 수행 — 해당 Compartment 를 통째로 비운다)
-- 비용 알림을 받을 이메일 (선택)
 
 ---
 
@@ -148,13 +139,13 @@ client/
 └── server-cert.pem    # 서버 자체서명 인증서
 ```
 
-설정 파일 생성은 `server-setup.sh` 가 담당한다. 방식 B 의 `deploy_vpn_oci.sh` 는
+설정 파일 생성은 항상 `server-setup.sh` 가 담당한다. 방식 A 의 `deploy_vpn_oci.sh` 는
 서버가 만들어 둔 것을 내려받기만 하므로 두 방식의 결과물이 항상 같다.
 
 > 서버의 `~/vpn-client/` 에도 같은 파일이 남는다. 내려받은 뒤 지우고 싶으면
 > `ssh <계정>@<IP> 'rm -rf ~/vpn-client'`
 
-### 3. Windows 클라이언트
+## Windows 클라이언트
 
 [Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev/releases) 를 설치한다.
 
@@ -332,7 +323,7 @@ GAME_PROCESS=MyGame.exe TRAFFIC_LIMIT_GB=9000 bash server-setup.sh
 echo 9000 | sudo tee /etc/vpn-traffic-limit-gb
 ```
 
-### 방식 B 전용 (`deploy_vpn_oci.sh`)
+### 방식 A 전용 (`deploy_vpn_oci.sh` — 인스턴스 생성 관련)
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|

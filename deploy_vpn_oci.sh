@@ -111,19 +111,48 @@ detect_public_ip() {
     return 1
 }
 
+# 이 스크립트를 돌리는 머신(보통 Cloud Shell)은 설치를 위해 서버로 SSH 해야 한다.
+# 그 IP 와, 앞으로 관리에 쓸 내 고정 IP 는 다를 수 있으므로 둘 다 허용한다.
+DEPLOY_IP=$(detect_public_ip) || die "공인 IP 자동 감지 실패. ADMIN_CIDR=1.2.3.4/32 형태로 직접 지정하세요."
+
+IN_CLOUD_SHELL=false
+if [ -n "${OCI_CLI_CLOUD_SHELL:-}" ] || [[ "$(hostname 2>/dev/null)" == *cloudshell* ]]; then
+    IN_CLOUD_SHELL=true
+fi
+
+if $IN_CLOUD_SHELL; then
+    info "Cloud Shell 에서 실행 중입니다 (IP: $DEPLOY_IP)"
+    info "Cloud Shell 의 IP 는 세션마다 바뀌므로 관리용으로는 쓸 수 없습니다."
+    info "평소 SSH 로 접속할 내 고정 IP 를 입력하세요. 모르면 https://ifconfig.me 에서 확인."
+else
+    info "감지된 현재 공인 IP: $DEPLOY_IP"
+fi
+
 if [ -n "${ADMIN_CIDR:-}" ]; then
     info "환경변수로 지정된 값 사용: $ADMIN_CIDR"
 else
-    MY_IP=$(detect_public_ip) || die "공인 IP 자동 감지 실패. ADMIN_CIDR=1.2.3.4/32 형태로 직접 지정하세요."
-    info "감지된 현재 공인 IP: $MY_IP"
-    read -r -p "    SSH 를 허용할 대역 [${MY_IP}/32]: " ADMIN_CIDR
-    ADMIN_CIDR="${ADMIN_CIDR:-${MY_IP}/32}"
+    if $IN_CLOUD_SHELL; then
+        read -r -p "    관리용 SSH 허용 대역 (Enter 시 Cloud Shell IP 만 허용): " ADMIN_CIDR
+        ADMIN_CIDR="${ADMIN_CIDR:-${DEPLOY_IP}/32}"
+    else
+        read -r -p "    SSH 를 허용할 대역 [${DEPLOY_IP}/32]: " ADMIN_CIDR
+        ADMIN_CIDR="${ADMIN_CIDR:-${DEPLOY_IP}/32}"
+    fi
 fi
 [[ "$ADMIN_CIDR" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || die "ADMIN_CIDR 형식이 잘못되었습니다: $ADMIN_CIDR"
 if [ "$ADMIN_CIDR" = "0.0.0.0/0" ]; then
     warn "SSH 를 전 세계에 개방하는 설정입니다. 권장하지 않습니다."
 fi
-ok "SSH 허용 대역: $ADMIN_CIDR"
+
+# 설치를 수행하려면 이 머신의 IP 도 반드시 열려 있어야 한다.
+SSH_CIDRS=("$ADMIN_CIDR")
+if [ "$ADMIN_CIDR" != "${DEPLOY_IP}/32" ] && [ "$ADMIN_CIDR" != "0.0.0.0/0" ]; then
+    SSH_CIDRS+=("${DEPLOY_IP}/32")
+    warn "설치를 위해 이 머신의 IP(${DEPLOY_IP}/32)도 임시로 허용합니다."
+    warn "배포 후 './ssh-allow-ip.sh ${ADMIN_CIDR}' 를 실행하면 내 IP 하나만 남길 수 있습니다."
+fi
+ADMIN_CIDR_LIST="${SSH_CIDRS[*]}"
+ok "SSH 허용 대역: $ADMIN_CIDR_LIST"
 
 # ---------------------------------------------------------------- 기존 리소스 정리
 step "기존 리소스 정리 (선택)"
@@ -197,17 +226,18 @@ oci network route-table update --rt-id "$RT_ID" --region "$REGION" --force \
 ok "라우팅 구성 완료"
 
 step "Security List 생성 (필요한 포트만 개방)"
+ADMIN_CIDR_JSON=$(printf '%s\n' "${SSH_CIDRS[@]}" | jq -R . | jq -sc .)
 INGRESS_RULES=$(jq -nc \
-    --arg admin "$ADMIN_CIDR" \
+    --argjson admins "$ADMIN_CIDR_JSON" \
     --argjson hy2 "$HY2_PORT" \
     --argjson vless "$VLESS_PORT" \
     --argjson enable_vless "$ENABLE_VLESS" '
+    # SSH: 지정한 IP 에서만 (배포 머신 IP 가 다르면 그것도 포함)
+    ($admins | map({source:., protocol:"6", isStateless:false,
+                    description:"SSH (admin only)",
+                    tcpOptions:{destinationPortRange:{min:22,max:22}}}))
+    +
     [
-      # SSH: 지정한 IP 에서만
-      {source:$admin, protocol:"6", isStateless:false,
-       description:"SSH (admin only)",
-       tcpOptions:{destinationPortRange:{min:22,max:22}}},
-
       # Hysteria2 (QUIC/UDP). 인증 실패 시 무응답이라 포트스캔에 잡히지 않는다.
       {source:"0.0.0.0/0", protocol:"17", isStateless:false,
        description:"Hysteria2",
@@ -237,7 +267,7 @@ if [ "$ENABLE_VLESS" = "true" ]; then
 else
     PORT_SUMMARY="UDP ${HY2_PORT} (Hysteria2)"
 fi
-info "개방: ${PORT_SUMMARY} / TCP 22(${ADMIN_CIDR})"
+info "개방: ${PORT_SUMMARY} / TCP 22(${ADMIN_CIDR_LIST})"
 
 SUBNET_ID=$(oci network subnet create \
     --compartment-id "$COMPARTMENT_ID" --vcn-id "$VCN_ID" \
@@ -320,7 +350,7 @@ for _ in $(seq 1 40); do
 done
 printf '\n'
 if [ "$SSH_OK" != true ]; then
-    die "SSH 타임아웃. ADMIN_CIDR($ADMIN_CIDR)가 현재 접속 중인 공인 IP 와 다를 수 있습니다. Security List 를 확인하세요."
+    die "SSH 타임아웃. 허용 대역($ADMIN_CIDR_LIST)가 현재 접속 중인 공인 IP 와 다를 수 있습니다. Security List 를 확인하세요."
 fi
 ok "SSH 연결됨"
 
@@ -330,7 +360,7 @@ scp "${SSH_OPTS[@]}" -q "$SCRIPT_DIR/server-setup.sh" "ubuntu@$PUBLIC_IP:/tmp/se
 printf '%s\n' "────────────────────────────────────────────"
 ssh "${SSH_OPTS[@]}" "ubuntu@$PUBLIC_IP" \
     "chmod +x /tmp/server-setup.sh && \
-     ADMIN_CIDR='$ADMIN_CIDR' HY2_PORT='$HY2_PORT' VLESS_PORT='$VLESS_PORT' \
+     ADMIN_CIDR='$ADMIN_CIDR_LIST' HY2_PORT='$HY2_PORT' VLESS_PORT='$VLESS_PORT' \
      ENABLE_VLESS='$ENABLE_VLESS' HY2_SNI='$HY2_SNI' REALITY_DEST='$REALITY_DEST' \
      EGRESS_MBPS='$EGRESS_MBPS' INGRESS_MBPS='$INGRESS_MBPS' \
      TRAFFIC_LIMIT_GB='$TRAFFIC_LIMIT_GB' SSH_USER='ubuntu' \
@@ -417,7 +447,7 @@ $(printf '%s' "$c_ok")════════════════ 배포 �
 
   서버        ${PUBLIC_IP}  (${REGION})
   개방 포트   ${PORT_SUMMARY}
-              TCP 22 은 ${ADMIN_CIDR} 에서만
+              TCP 22 은 ${ADMIN_CIDR_LIST} 에서만
   트래픽 상한 월 ${TRAFFIC_LIMIT_GB} GB 송신 시 서비스 자동 정지
 
   클라이언트 설정   ${OUT_DIR}/
