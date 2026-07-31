@@ -279,13 +279,32 @@ info "Subnet: $SUBNET_ID"
 
 # ---------------------------------------------------------------- SSH 키
 step "SSH 키 준비"
+mkdir -p "$(dirname "$SSH_KEY")"
+chmod 700 "$(dirname "$SSH_KEY")" 2>/dev/null || true
+
 if [ ! -f "$SSH_KEY" ]; then
-    ssh-keygen -t ed25519 -f "$SSH_KEY" -N "" -C "gvpn-oci" >/dev/null
-    ok "새 키 생성: $SSH_KEY"
+    # ed25519 를 기본으로 하되, FIPS 모드(OCI Cloud Shell 등)에서는 거부되므로
+    # RSA 4096 으로 자동 대체한다. 둘 다 OCI 가 받아들인다.
+    if ssh-keygen -t ed25519 -f "$SSH_KEY" -N "" -C "gvpn-oci" >/dev/null 2>&1; then
+        ok "새 키 생성 (ed25519): $SSH_KEY"
+    else
+        warn "ed25519 를 쓸 수 없는 환경입니다 (FIPS 모드). RSA 4096 으로 생성합니다."
+        rm -f "$SSH_KEY" "${SSH_KEY}.pub"
+        ssh-keygen -t rsa -b 4096 -f "$SSH_KEY" -N "" -C "gvpn-oci" >/dev/null \
+            || die "SSH 키 생성에 실패했습니다."
+        ok "새 키 생성 (rsa 4096): $SSH_KEY"
+    fi
 else
     ok "기존 키 사용: $SSH_KEY"
 fi
+
+# 공개키가 없으면 개인키에서 다시 뽑는다 (중간에 끊긴 경우 대비)
+if [ ! -f "${SSH_KEY}.pub" ]; then
+    ssh-keygen -y -f "$SSH_KEY" > "${SSH_KEY}.pub" || die "공개키를 생성할 수 없습니다: ${SSH_KEY}.pub"
+    info "공개키를 다시 생성했습니다."
+fi
 chmod 600 "$SSH_KEY"
+chmod 644 "${SSH_KEY}.pub"
 
 # ---------------------------------------------------------------- 인스턴스
 step "인스턴스 생성"
