@@ -18,6 +18,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REGION="${REGION:-us-sanjose-1}"
 DISPLAY_NAME="${DISPLAY_NAME:-gvpn-server}"
 PREFIX="${PREFIX:-gvpn}"
+SHAPE_FROM_ENV="${SHAPE:-}"          # 비어 있으면 실행 중에 물어본다
 SHAPE="${SHAPE:-VM.Standard.A1.Flex}"
 OCPU_COUNT="${OCPU_COUNT:-1}"
 MEMORY_GB="${MEMORY_GB:-6}"
@@ -43,6 +44,7 @@ TRAFFIC_LIMIT_GB="${TRAFFIC_LIMIT_GB:-8000}"
 # TUN 분할 라우팅에서 프록시를 태울 프로세스. 나중에 클라이언트 설정에서 수정 가능.
 GAME_PROCESS="${GAME_PROCESS:-game.exe}"
 
+RETRIES_FROM_ENV="${LAUNCH_RETRIES:-}"   # 사용자가 직접 준 값인지 구분한다
 LAUNCH_RETRIES="${LAUNCH_RETRIES:-20}"
 LAUNCH_RETRY_DELAY="${LAUNCH_RETRY_DELAY:-60}"
 
@@ -171,27 +173,79 @@ else
     info "건너뜁니다."
 fi
 
+# ---------------------------------------------------------------- 셰이프 선택
+step "인스턴스 종류 선택"
+# A1(ARM)  : 1 OCPU / 6GB / ~1Gbps. 성능 여유가 크지만 무료 용량이 거의 없다.
+# E2(AMD)  : 1 OCPU / 1GB / 480Mbps. 자리가 잘 나고, VPN 용도로는 충분하다.
+if [ -n "$SHAPE_FROM_ENV" ]; then
+    info "환경변수로 지정된 셰이프 사용: $SHAPE"
+elif [ ! -t 0 ]; then
+    info "비대화형 실행입니다. 기본값(A1 우선, 실패 시 E2 자동 전환)을 사용합니다."
+else
+    echo "    1) A1(ARM) 우선, 용량 없으면 E2(AMD) 자동 전환   [기본]"
+    echo "    2) A1(ARM) 만 — 자리 날 때까지 오래 재시도"
+    echo "    3) E2(AMD) 로 바로 — 지금 바로 만들어짐"
+    read -r -p "    선택 [1]: " SHAPE_CHOICE
+    case "${SHAPE_CHOICE:-1}" in
+        2)
+            SHAPE="VM.Standard.A1.Flex"
+            ALLOW_FALLBACK=false
+            # 환경변수로 직접 지정하지 않았다면 오래 기다리는 값으로 바꾼다.
+            if [ -z "$RETRIES_FROM_ENV" ]; then
+                LAUNCH_RETRIES=60
+                LAUNCH_RETRY_DELAY=120
+            fi
+            info "A1 만 시도합니다. 최대 ${LAUNCH_RETRIES}회 x ${LAUNCH_RETRY_DELAY}초 (약 $(( LAUNCH_RETRIES * LAUNCH_RETRY_DELAY / 60 ))분)."
+            warn "Cloud Shell 은 세션이 끊기면 중단됩니다. 창을 닫지 마세요."
+            ;;
+        3)
+            SHAPE="VM.Standard.E2.1.Micro"
+            ALLOW_FALLBACK=false
+            info "E2(AMD) 로 바로 생성합니다."
+            ;;
+        *)
+            SHAPE="VM.Standard.A1.Flex"
+            ALLOW_FALLBACK=true
+            ;;
+    esac
+fi
+
 # ---------------------------------------------------------------- 리전/셰이프/이미지
 step "리전 가용성 및 이미지 확인"
-AVAILABILITY_DOMAIN=$(oci iam availability-domain list \
-    --region "$REGION" --compartment-id "$COMPARTMENT_ID" \
-    --query 'data[0].name' --raw-output 2>/dev/null || true)
-[ -n "$AVAILABILITY_DOMAIN" ] || die "$REGION 리전을 사용할 수 없습니다."
+# 가용성 도메인은 전부 모은다. A1 용량은 AD 마다 따로라 하나가 막혀도 다른 데가 열려 있을 수 있다.
+mapfile -t ADS < <(oci iam availability-domain list \
+    --region "$REGION" --compartment-id "$COMPARTMENT_ID" 2>/dev/null \
+    | jq -r '.data[].name' 2>/dev/null || true)
+[ "${#ADS[@]}" -gt 0 ] || die "$REGION 리전을 사용할 수 없습니다."
+info "가용성 도메인 ${#ADS[@]}개: ${ADS[*]}"
 
-SHAPE_OK=$(oci compute shape list \
-    --compartment-id "$COMPARTMENT_ID" --availability-domain "$AVAILABILITY_DOMAIN" \
-    --region "$REGION" \
-    --query "data[?shape=='$SHAPE'] | [0].shape" --raw-output 2>/dev/null || true)
-[ -n "$SHAPE_OK" ] || die "$REGION 에서 $SHAPE 를 사용할 수 없습니다."
+find_image() {
+    oci compute image list \
+        --compartment-id "$COMPARTMENT_ID" \
+        --operating-system "Canonical Ubuntu" --operating-system-version "24.04" \
+        --shape "$1" --region "$REGION" \
+        --sort-by TIMECREATED --sort-order DESC --limit 1 \
+        --query 'data[0].id' --raw-output 2>/dev/null || true
+}
 
-IMAGE_ID=$(oci compute image list \
-    --compartment-id "$COMPARTMENT_ID" \
-    --operating-system "Canonical Ubuntu" --operating-system-version "24.04" \
-    --shape "$SHAPE" --region "$REGION" \
-    --sort-by TIMECREATED --sort-order DESC --limit 1 \
-    --query 'data[0].id' --raw-output 2>/dev/null || true)
-[ -n "$IMAGE_ID" ] || die "Ubuntu 24.04 ARM64 이미지를 찾을 수 없습니다."
-ok "AD=$AVAILABILITY_DOMAIN / shape=$SHAPE / image=${IMAGE_ID:0:32}..."
+IMAGE_ID=$(find_image "$SHAPE")
+[ -n "$IMAGE_ID" ] || die "$SHAPE 용 Ubuntu 24.04 이미지를 찾을 수 없습니다."
+ok "shape=$SHAPE / image=${IMAGE_ID:0:32}..."
+
+# A1 용량 부족에 대비한 대체 셰이프.
+# VM.Standard.E2.1.Micro 는 AMD x86 Always Free 로, A1 보다 자리가 훨씬 잘 난다.
+# 1 OCPU / 1GB / 480Mbps 라 sing-box 를 돌리기엔 충분하다.
+FALLBACK_SHAPE="${FALLBACK_SHAPE:-VM.Standard.E2.1.Micro}"
+ALLOW_FALLBACK="${ALLOW_FALLBACK:-true}"
+FALLBACK_IMAGE_ID=""
+if [ "$ALLOW_FALLBACK" = "true" ] && [ "$SHAPE" != "$FALLBACK_SHAPE" ]; then
+    FALLBACK_IMAGE_ID=$(find_image "$FALLBACK_SHAPE")
+    if [ -n "$FALLBACK_IMAGE_ID" ]; then
+        info "대체 셰이프 준비됨: $FALLBACK_SHAPE (A1 용량 확보 실패 시 사용)"
+    else
+        warn "대체 셰이프 $FALLBACK_SHAPE 의 이미지를 찾지 못했습니다. A1 만 시도합니다."
+    fi
+fi
 
 # 무료 한도 안내
 if [ "$OCPU_COUNT" -gt 4 ] || [ "$MEMORY_GB" -gt 24 ]; then
@@ -202,20 +256,47 @@ if [ "$BOOT_VOLUME_GB" -gt 200 ]; then
 fi
 
 # ---------------------------------------------------------------- 네트워크
-step "VCN / 게이트웨이 / 라우팅 생성"
-VCN_ID=$(oci network vcn create \
-    --compartment-id "$COMPARTMENT_ID" --cidr-block "10.0.0.0/16" \
-    --display-name "${PREFIX}-vcn" --dns-label "${PREFIX}vcn" \
-    --region "$REGION" --wait-for-state AVAILABLE \
-    --query 'data.id' --raw-output)
-info "VCN: $VCN_ID"
+# 이 절은 멱등하다. 같은 이름의 리소스가 이미 있으면 만들지 않고 재사용한다.
+# 셰이프를 바꿔 재배포할 때 VCN 이 쌓이는 것을 막는다 (VCN 은 리전당 기본 10개 제한).
+step "네트워크 확인 (있으면 재사용)"
 
-IGW_ID=$(oci network internet-gateway create \
-    --compartment-id "$COMPARTMENT_ID" --vcn-id "$VCN_ID" --is-enabled true \
-    --display-name "${PREFIX}-igw" --region "$REGION" --wait-for-state AVAILABLE \
-    --query 'data.id' --raw-output)
-info "IGW: $IGW_ID"
+# lifecycle-state 가 AVAILABLE 인 첫 리소스의 OCID 를 뽑는다. 없으면 빈 문자열.
+pick_available() { jq -r '[.data[]? | select(."lifecycle-state"=="AVAILABLE")][0].id // empty'; }
 
+if [ -n "${SUBNET_ID:-}" ]; then
+    # 서브넷 OCID 를 직접 준 경우 네트워크 단계를 통째로 건너뛴다.
+    ok "지정된 서브넷 사용: $SUBNET_ID"
+    SECLIST_ID=$(oci network subnet get --subnet-id "$SUBNET_ID" --region "$REGION" \
+        --query 'data."security-list-ids"[0]' --raw-output 2>/dev/null || true)
+else
+
+VCN_ID=$(oci network vcn list --compartment-id "$COMPARTMENT_ID" --region "$REGION" \
+    --display-name "${PREFIX}-vcn" 2>/dev/null | pick_available || true)
+if [ -n "$VCN_ID" ]; then
+    ok "VCN 재사용: $VCN_ID"
+else
+    VCN_ID=$(oci network vcn create \
+        --compartment-id "$COMPARTMENT_ID" --cidr-block "10.0.0.0/16" \
+        --display-name "${PREFIX}-vcn" --dns-label "${PREFIX}vcn" \
+        --region "$REGION" --wait-for-state AVAILABLE \
+        --query 'data.id' --raw-output)
+    ok "VCN 생성: $VCN_ID"
+fi
+
+IGW_ID=$(oci network internet-gateway list \
+    --compartment-id "$COMPARTMENT_ID" --vcn-id "$VCN_ID" --region "$REGION" 2>/dev/null \
+    | pick_available || true)
+if [ -n "$IGW_ID" ]; then
+    ok "인터넷 게이트웨이 재사용: $IGW_ID"
+else
+    IGW_ID=$(oci network internet-gateway create \
+        --compartment-id "$COMPARTMENT_ID" --vcn-id "$VCN_ID" --is-enabled true \
+        --display-name "${PREFIX}-igw" --region "$REGION" --wait-for-state AVAILABLE \
+        --query 'data.id' --raw-output)
+    ok "인터넷 게이트웨이 생성: $IGW_ID"
+fi
+
+# 라우팅은 덮어쓰기라 몇 번 실행해도 결과가 같다.
 RT_ID=$(oci network route-table list \
     --compartment-id "$COMPARTMENT_ID" --vcn-id "$VCN_ID" --region "$REGION" \
     --query 'data[0].id' --raw-output)
@@ -225,7 +306,7 @@ oci network route-table update --rt-id "$RT_ID" --region "$REGION" --force \
     --wait-for-state AVAILABLE > /dev/null
 ok "라우팅 구성 완료"
 
-step "Security List 생성 (필요한 포트만 개방)"
+# ---- Security List ----
 ADMIN_CIDR_JSON=$(printf '%s\n' "${SSH_CIDRS[@]}" | jq -R . | jq -sc .)
 INGRESS_RULES=$(jq -nc \
     --argjson admins "$ADMIN_CIDR_JSON" \
@@ -254,28 +335,54 @@ INGRESS_RULES=$(jq -nc \
           description:"VLESS-REALITY fallback",
           tcpOptions:{destinationPortRange:{min:$vless,max:$vless}}}]
        else [] end)')
+EGRESS_RULES='[{"destination":"0.0.0.0/0","protocol":"all","isStateless":false}]'
 
-SECLIST_ID=$(oci network security-list create \
-    --compartment-id "$COMPARTMENT_ID" --vcn-id "$VCN_ID" \
-    --display-name "${PREFIX}-seclist" --region "$REGION" \
-    --egress-security-rules '[{"destination":"0.0.0.0/0","protocol":"all","isStateless":false}]' \
-    --ingress-security-rules "$INGRESS_RULES" \
-    --wait-for-state AVAILABLE --query 'data.id' --raw-output)
-ok "Security List: $SECLIST_ID"
+SECLIST_ID=$(oci network security-list list \
+    --compartment-id "$COMPARTMENT_ID" --vcn-id "$VCN_ID" --region "$REGION" \
+    --display-name "${PREFIX}-seclist" 2>/dev/null | pick_available || true)
+if [ -n "$SECLIST_ID" ]; then
+    # 재사용 시에도 규칙은 항상 최신 상태로 덮어쓴다 (SSH 허용 IP 가 바뀌었을 수 있다).
+    oci network security-list update --security-list-id "$SECLIST_ID" --region "$REGION" --force \
+        --ingress-security-rules "$INGRESS_RULES" --egress-security-rules "$EGRESS_RULES" \
+        --wait-for-state AVAILABLE > /dev/null
+    ok "Security List 재사용 및 규칙 갱신: $SECLIST_ID"
+else
+    SECLIST_ID=$(oci network security-list create \
+        --compartment-id "$COMPARTMENT_ID" --vcn-id "$VCN_ID" \
+        --display-name "${PREFIX}-seclist" --region "$REGION" \
+        --egress-security-rules "$EGRESS_RULES" \
+        --ingress-security-rules "$INGRESS_RULES" \
+        --wait-for-state AVAILABLE --query 'data.id' --raw-output)
+    ok "Security List 생성: $SECLIST_ID"
+fi
+
+# ---- 서브넷 ----
+SUBNET_ID=$(oci network subnet list \
+    --compartment-id "$COMPARTMENT_ID" --vcn-id "$VCN_ID" --region "$REGION" \
+    --display-name "${PREFIX}-subnet" 2>/dev/null | pick_available || true)
+if [ -n "$SUBNET_ID" ]; then
+    oci network subnet update --subnet-id "$SUBNET_ID" --region "$REGION" --force \
+        --security-list-ids "$(jq -nc --arg s "$SECLIST_ID" '[$s]')" \
+        --wait-for-state AVAILABLE > /dev/null
+    ok "서브넷 재사용: $SUBNET_ID"
+else
+    SUBNET_ID=$(oci network subnet create \
+        --compartment-id "$COMPARTMENT_ID" --vcn-id "$VCN_ID" \
+        --cidr-block "10.0.1.0/24" --display-name "${PREFIX}-subnet" --dns-label "${PREFIX}sub" \
+        --security-list-ids "$(jq -nc --arg s "$SECLIST_ID" '[$s]')" \
+        --route-table-id "$RT_ID" --region "$REGION" --wait-for-state AVAILABLE \
+        --query 'data.id' --raw-output)
+    ok "서브넷 생성: $SUBNET_ID"
+fi
+
+fi   # SUBNET_ID 직접 지정 여부 분기 끝
+
 if [ "$ENABLE_VLESS" = "true" ]; then
     PORT_SUMMARY="UDP ${HY2_PORT} (Hysteria2) / TCP ${VLESS_PORT} (VLESS-REALITY)"
 else
     PORT_SUMMARY="UDP ${HY2_PORT} (Hysteria2)"
 fi
 info "개방: ${PORT_SUMMARY} / TCP 22(${ADMIN_CIDR_LIST})"
-
-SUBNET_ID=$(oci network subnet create \
-    --compartment-id "$COMPARTMENT_ID" --vcn-id "$VCN_ID" \
-    --cidr-block "10.0.1.0/24" --display-name "${PREFIX}-subnet" --dns-label "${PREFIX}sub" \
-    --security-list-ids "$(jq -nc --arg s "$SECLIST_ID" '[$s]')" \
-    --route-table-id "$RT_ID" --region "$REGION" --wait-for-state AVAILABLE \
-    --query 'data.id' --raw-output)
-info "Subnet: $SUBNET_ID"
 
 # ---------------------------------------------------------------- SSH 키
 step "SSH 키 준비"
@@ -308,35 +415,105 @@ chmod 644 "${SSH_KEY}.pub"
 
 # ---------------------------------------------------------------- 인스턴스
 step "인스턴스 생성"
+
+# 이미 돌고 있는 같은 이름의 인스턴스가 있으면 알려준다.
+# 셰이프를 바꿔 재배포할 때 예전 인스턴스가 조용히 남아 무료 한도를 갉아먹는 걸 막는다.
+EXISTING=$(oci compute instance list \
+    --compartment-id "$COMPARTMENT_ID" --region "$REGION" \
+    --display-name "$DISPLAY_NAME" 2>/dev/null \
+    | jq -r '[.data[]? | select(."lifecycle-state"=="RUNNING")] | .[] | "\(.id)\t\(.shape)"' 2>/dev/null || true)
+if [ -n "$EXISTING" ]; then
+    warn "같은 이름('$DISPLAY_NAME')으로 실행 중인 인스턴스가 있습니다:"
+    while IFS=$'\t' read -r eid eshape; do
+        info "  $eshape  ${eid:0:40}..."
+    done <<< "$EXISTING"
+    info "새로 만들면 두 대가 동시에 돌아가며 둘 다 무료 한도를 씁니다."
+    info "기존 것을 지우려면: oci compute instance terminate --instance-id <OCID> --region $REGION"
+    read -r -p "    새 인스턴스를 만들까요? (yes/no) [no]: " ans
+    [ "${ans:-no}" = "yes" ] || die "중단합니다."
+fi
+
+# 한 번 시도. 성공하면 인스턴스 OCID 를 표준출력으로 내보낸다.
+try_launch() {
+    local shape="$1" image="$2" ad="$3"
+    local args=(
+        --compartment-id "$COMPARTMENT_ID"
+        --availability-domain "$ad"
+        --display-name "$DISPLAY_NAME"
+        --shape "$shape"
+        --image-id "$image"
+        --boot-volume-size-in-gbs "$BOOT_VOLUME_GB"
+        --subnet-id "$SUBNET_ID"
+        --assign-public-ip true
+        --ssh-authorized-keys-file "${SSH_KEY}.pub"
+        --region "$REGION"
+        --wait-for-state RUNNING
+        --query 'data.id' --raw-output
+    )
+    # Flex 셰이프만 OCPU/메모리를 지정할 수 있다. E2.1.Micro 같은 고정 셰이프는 거부한다.
+    if [[ "$shape" == *Flex* ]]; then
+        args+=(--shape-config "$(jq -nc --argjson o "$OCPU_COUNT" --argjson m "$MEMORY_GB" \
+            '{ocpus:$o,memoryInGBs:$m}')")
+    fi
+    oci compute instance launch "${args[@]}" 2>"$TMPDIR_LOCAL/launch.err"
+}
+
+is_capacity_error() {
+    grep -qiE 'out of host capacity|out of capacity|InternalError|TooManyRequests|LimitExceeded' \
+        "$TMPDIR_LOCAL/launch.err"
+}
+
+# 셰이프 하나에 대해 모든 AD 를 훑으며 재시도한다.
+launch_with_retries() {
+    local shape="$1" image="$2" retries="$3"
+    local attempt ad
+    for attempt in $(seq 1 "$retries"); do
+        for ad in "${ADS[@]}"; do
+            if INSTANCE_ID=$(try_launch "$shape" "$image" "$ad"); then
+                LAUNCHED_SHAPE="$shape"
+                LAUNCHED_AD="$ad"
+                return 0
+            fi
+            INSTANCE_ID=""
+            if ! is_capacity_error; then
+                cat "$TMPDIR_LOCAL/launch.err" >&2
+                die "인스턴스 생성 실패 (용량 문제가 아닙니다)"
+            fi
+        done
+        if [ "$attempt" -lt "$retries" ]; then
+            warn "용량 부족: $shape / AD ${#ADS[@]}곳 모두 (시도 ${attempt}/${retries}). ${LAUNCH_RETRY_DELAY}초 후 재시도합니다."
+            sleep "$LAUNCH_RETRY_DELAY"
+        else
+            warn "용량 부족: $shape / AD ${#ADS[@]}곳 모두 (시도 ${attempt}/${retries}). 마지막 시도였습니다."
+        fi
+    done
+    return 1
+}
+
 INSTANCE_ID=""
-for attempt in $(seq 1 "$LAUNCH_RETRIES"); do
-    if INSTANCE_ID=$(oci compute instance launch \
-        --compartment-id "$COMPARTMENT_ID" \
-        --availability-domain "$AVAILABILITY_DOMAIN" \
-        --display-name "$DISPLAY_NAME" \
-        --shape "$SHAPE" \
-        --shape-config "$(jq -nc --argjson o "$OCPU_COUNT" --argjson m "$MEMORY_GB" '{ocpus:$o,memoryInGBs:$m}')" \
-        --image-id "$IMAGE_ID" \
-        --boot-volume-size-in-gbs "$BOOT_VOLUME_GB" \
-        --subnet-id "$SUBNET_ID" \
-        --assign-public-ip true \
-        --ssh-authorized-keys-file "${SSH_KEY}.pub" \
-        --region "$REGION" \
-        --wait-for-state RUNNING \
-        --query 'data.id' --raw-output 2>"$TMPDIR_LOCAL/launch.err"); then
-        break
-    fi
-    if grep -qiE 'out of host capacity|out of capacity|InternalError|TooManyRequests' "$TMPDIR_LOCAL/launch.err"; then
-        warn "용량 부족 (시도 ${attempt}/${LAUNCH_RETRIES}). ${LAUNCH_RETRY_DELAY}초 후 재시도합니다."
-        INSTANCE_ID=""
-        sleep "$LAUNCH_RETRY_DELAY"
+LAUNCHED_SHAPE=""
+LAUNCHED_AD=""
+
+if ! launch_with_retries "$SHAPE" "$IMAGE_ID" "$LAUNCH_RETRIES"; then
+    if [ -n "$FALLBACK_IMAGE_ID" ]; then
+        warn "$SHAPE 용량을 확보하지 못했습니다."
+        info "대체 셰이프 $FALLBACK_SHAPE (AMD, 1 OCPU / 1GB / 480Mbps) 로 전환합니다."
+        info "VPN 용도로는 성능 차이가 거의 없고, 이쪽은 자리가 잘 납니다."
+        launch_with_retries "$FALLBACK_SHAPE" "$FALLBACK_IMAGE_ID" 3 \
+            || die "$(printf '%s\n' \
+                "$SHAPE 와 $FALLBACK_SHAPE 모두 용량을 확보하지 못했습니다." \
+                "" \
+                "해볼 수 있는 것:" \
+                "  - 시간을 두고 재실행 (새벽/주말에 자리가 나는 편)" \
+                "  - LAUNCH_RETRIES=200 LAUNCH_RETRY_DELAY=120 ./deploy_vpn_oci.sh 로 오래 돌리기" \
+                "  - 계정을 Pay-As-You-Go 로 전환 (Always Free 자원은 그대로 무료이고" \
+                "    A1 용량 배정 우선순위가 올라간다. 단, 무료 한도를 넘기면 과금된다)")"
     else
-        cat "$TMPDIR_LOCAL/launch.err" >&2
-        die "인스턴스 생성 실패"
+        die "재시도 한도 내에 인스턴스를 확보하지 못했습니다. 나중에 다시 시도하세요."
     fi
-done
-[ -n "$INSTANCE_ID" ] || die "재시도 한도 내에 인스턴스를 확보하지 못했습니다. 나중에 다시 시도하세요."
+fi
 ok "Instance: $INSTANCE_ID"
+info "셰이프: $LAUNCHED_SHAPE / AD: $LAUNCHED_AD"
 
 VNIC_ID=$(oci compute instance list-vnics --instance-id "$INSTANCE_ID" --region "$REGION" \
     --query 'data[0].id' --raw-output)

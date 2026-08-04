@@ -66,7 +66,56 @@ chmod +x deploy_vpn_oci.sh server-setup.sh
 |---|---|
 | 관리용 SSH 허용 대역 | **내 집 고정 IP** 를 `1.2.3.4/32` 형태로. 모르면 내 PC 브라우저에서 <https://ifconfig.me> |
 | 기존 리소스 정리 | 처음이면 그냥 Enter |
+| **인스턴스 종류** | 아래 표 참고. 그냥 Enter 면 A1 시도 후 안 되면 E2 |
 | 비용 알림 이메일 | 받을 주소, 건너뛰려면 Enter |
+
+### 인스턴스 종류 (A1 vs E2)
+
+| | A1.Flex (ARM) | E2.1.Micro (AMD) |
+|---|---|---|
+| CPU / RAM | 1 OCPU / 6GB | 1 OCPU / **1GB** |
+| 네트워크 | ~1 Gbps | **480 Mbps** |
+| 무료 대수 | 4 OCPU / 24GB 내 | 2대 |
+| 자리 | **거의 없음** (`Out of host capacity`) | 여유 |
+
+두 할당량은 **별개**다. E2 를 만들어도 A1 자리를 잡아먹지 않는다.
+
+**게임 VPN 에는 E2 로 충분하다.** 게임 트래픽은 보통 50~200 Kbps 라 480 Mbps 의 수천 분의 일이고,
+어차피 한국↔미국 태평양 구간 실측 대역폭이 그보다 훨씬 낮아 서버 NIC 는 병목이 아니다.
+sing-box 자체도 메모리를 50MB 남짓 쓴다.
+
+A1 이 의미 있는 경우는 **이 서버에 VPN 말고 다른 것도 올릴 때**다.
+
+선택지 세 가지:
+
+```
+1) A1 우선, 용량 없으면 E2 자동 전환   [기본]  — 20분 시도 후 전환
+2) A1 만 — 최대 2시간 재시도                   — Cloud Shell 창을 닫으면 중단됨
+3) E2 로 바로                                  — 즉시 생성
+```
+
+환경변수로도 지정할 수 있다.
+
+```bash
+SHAPE=VM.Standard.E2.1.Micro ./deploy_vpn_oci.sh   # 질문 없이 E2
+SHAPE=VM.Standard.A1.Flex ALLOW_FALLBACK=false ./deploy_vpn_oci.sh
+```
+
+### 나중에 셰이프를 바꾸고 싶으면
+
+네트워크(VCN·게이트웨이·서브넷·Security List)는 **이름이 같으면 재사용**하므로,
+그냥 다시 실행하면 인스턴스만 새로 만들어진다. VCN 이 쌓이지 않는다.
+
+```bash
+./deploy_vpn_oci.sh          # 다시 실행 -> 네트워크 재사용, 셰이프만 다시 선택
+```
+
+같은 이름의 인스턴스가 이미 돌고 있으면 경고하고 물어본다.
+**두 대를 동시에 켜두면 둘 다 무료 한도를 쓰므로**, 안 쓰는 쪽은 지우는 게 좋다.
+
+```bash
+oci compute instance terminate --instance-id <OCID> --region us-sanjose-1
+```
 
 > **Cloud Shell IP 는 세션마다 바뀌므로 관리용으로 쓸 수 없다.**
 > 그래서 배포 중에는 *Cloud Shell IP* 와 *내 고정 IP* 를 **둘 다** 허용해 두고,

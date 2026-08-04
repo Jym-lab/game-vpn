@@ -101,6 +101,21 @@ export DEBIAN_FRONTEND=noninteractive
 
 # ---------------------------------------------------------------- 1. 패키지
 log "[1/11] 패키지 설치"
+
+# A1 용량 부족으로 E2.1.Micro(1GB) 로 떨어질 수 있다.
+# 메모리가 작으면 apt 작업 중 OOM 이 나므로 스왑을 먼저 만들어 둔다.
+MEM_MB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+if [ "$MEM_MB" -lt 2048 ] && [ ! -f /swapfile ]; then
+    echo "메모리 ${MEM_MB}MB. 스왑 1GB 를 생성합니다."
+    sudo fallocate -l 1G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none
+    sudo chmod 600 /swapfile
+    sudo mkswap /swapfile > /dev/null
+    sudo swapon /swapfile
+    if ! grep -q '^/swapfile' /etc/fstab; then
+        echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab > /dev/null
+    fi
+fi
+
 # iptables-persistent 가 대화형 프롬프트를 띄우지 않도록 미리 응답
 echo 'iptables-persistent iptables-persistent/autosave_v4 boolean false' | sudo debconf-set-selections
 echo 'iptables-persistent iptables-persistent/autosave_v6 boolean false' | sudo debconf-set-selections
@@ -126,10 +141,17 @@ install_singbox_apt() {
 
 install_singbox_github() {
     warn "APT 저장소 설치 실패. GitHub 릴리스에서 직접 설치합니다."
-    local ver url tmp
+    local ver url tmp arch
+    # A1(ARM) 대신 AMD 셰이프로 떨어질 수 있으므로 아키텍처를 실제로 확인한다.
+    case "$(dpkg --print-architecture)" in
+        arm64) arch="linux-arm64" ;;
+        amd64) arch="linux-amd64" ;;
+        armhf) arch="linux-armv7" ;;
+        *)     die "지원하지 않는 아키텍처: $(dpkg --print-architecture)" ;;
+    esac
     ver=$(curl -fsSL --retry 3 https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' | sed 's/^v//')
     [ -n "$ver" ] && [ "$ver" != "null" ] || die "sing-box 최신 버전을 확인할 수 없습니다."
-    url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-arm64.tar.gz"
+    url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-${arch}.tar.gz"
     tmp=$(mktemp -d)
     curl -fsSL --retry 3 "$url" -o "$tmp/sb.tar.gz" || die "sing-box 다운로드 실패: $url"
     tar -xzf "$tmp/sb.tar.gz" -C "$tmp" --strip-components=1
